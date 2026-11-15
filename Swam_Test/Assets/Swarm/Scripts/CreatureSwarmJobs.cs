@@ -34,7 +34,8 @@ namespace SwarmTest
             return ((c.x * 73856093) ^ (c.y * 19349663) ^ (c.z * 83492791)) & mask;
         }
 
-        public static void SolveChain(NativeArray<float3> pos, int b, int K, float segLen, float bendStiffness, float minFoldRatio)
+        public static void SolveChain(NativeArray<float3> pos, int b, int K, NativeArray<float> restLen, NativeArray<float> restBend,
+                                      float bendStiffness, float minFoldRatio)
         {
             for (int k = 0; k < K - 1; k++)
             {
@@ -42,16 +43,16 @@ namespace SwarmTest
                 float3 d = pos[i + 1] - pos[i];
                 float len = length(d);
                 if (len < 1e-6f) continue;
-                float3 c = d * (0.5f * (len - segLen) / len);
+                float3 c = d * (0.5f * (len - restLen[k]) / len);
                 pos[i] += c; pos[i + 1] -= c;
             }
-            float rest2 = 2f * segLen, minLen = rest2 * minFoldRatio;
             for (int k = 0; k < K - 2; k++)
             {
                 int i = b + k;
                 float3 d = pos[i + 2] - pos[i];
                 float len = length(d);
                 if (len < 1e-6f) continue;
+                float rest2 = restBend[k], minLen = rest2 * minFoldRatio;
                 float goal = len < minLen ? minLen : lerp(len, rest2, bendStiffness);
                 float3 c = d * (0.5f * (len - goal) / len);
                 pos[i] += c; pos[i + 2] -= c;
@@ -119,19 +120,19 @@ namespace SwarmTest
     }
 
     [BurstCompile]
-    public struct WormStepJob : IJobParallelFor
+    public struct StepJob : IJobParallelFor
     {
         [NativeDisableParallelForRestriction] public NativeArray<float3> pos;
         [NativeDisableParallelForRestriction] public NativeArray<float3> prev;
         [ReadOnly] public NativeArray<byte> contact, onLevel;
-        [ReadOnly] public NativeArray<float3> nLevel, nWorm, moveDir;
-        [ReadOnly] public NativeArray<float> speedMul;
+        [ReadOnly] public NativeArray<float3> nLevel, nPile, moveDir;
+        [ReadOnly] public NativeArray<float> speedMul, restLen, restBend;
 
         public int K, iterations;
-        public float h, segLen, bendStiffness, minFoldRatio;
+        public float h, bendStiffness, minFoldRatio;
         public float3 gravity;
-        public float keepAir, keepSide, keepFwd, keepWorm;
-        public float crawlSpeed, bodyThrust, climbStrength, wormClimbStrength, floorY, maxClimbHeight;
+        public float keepAir, keepSide, keepFwd, keepPile;
+        public float moveSpeed, bodyThrust, climbStrength, pileClimbStrength, floorY, maxClimbHeight;
 
         public void Execute(int w)
         {
@@ -154,16 +155,16 @@ namespace SwarmTest
                         v = along * keepFwd + (v - along) * keepSide;
                     }
                 }
-                else if (contact[i] != 0) v *= keepWorm;
+                else if (contact[i] != 0) v *= keepPile;
                 prev[i] = pos[i];
                 pos[i] += v + g;
             }
 
-            float step = crawlSpeed * speedMul[w] * h;
+            float step = moveSpeed * speedMul[w] * h;
             if (contact[b] != 0 || contact[b + 1] != 0)
             {
                 float3 md = moveDir[w];
-                float3 hl = nLevel[b], hw = nWorm[b];
+                float3 hl = nLevel[b] + nLevel[b + 1], hw = nPile[b] + nPile[b + 1];
                 float3 hn = hl + hw;
                 if (lengthsq(hn) > 1e-6f)
                 {
@@ -172,7 +173,7 @@ namespace SwarmTest
                     float3 slide = md - dot(md, hn) * hn;
                     if (into < -0.2f && pos[b].y < floorY + maxClimbHeight)
                     {
-                        float climb = lengthsq(hl) > 1e-6f ? climbStrength : wormClimbStrength;
+                        float climb = lengthsq(hl) > 1e-6f ? climbStrength : pileClimbStrength;
                         md = slide + new float3(0, 1, 0) * (climb * -into);
                     }
                     else md = slide;
@@ -195,7 +196,7 @@ namespace SwarmTest
             }
 
             for (int it = 0; it < iterations; it++)
-                SwarmMath.SolveChain(pos, b, K, segLen, bendStiffness, minFoldRatio);
+                SwarmMath.SolveChain(pos, b, K, restLen, restBend, bendStiffness, minFoldRatio);
         }
     }
 
@@ -243,7 +244,7 @@ namespace SwarmTest
         [ReadOnly] public NativeArray<float3> pos;
         [ReadOnly] public NativeArray<float> rad;
         [ReadOnly] public NativeArray<int> sorted, hashStart, hashCount;
-        [WriteOnly] public NativeArray<float3> delta, nWorm;
+        [WriteOnly] public NativeArray<float3> delta, nPile;
         [WriteOnly] public NativeArray<byte> contact;
         [WriteOnly] public NativeArray<int> checks;
         public int K, mask; public float invCell, stiff;
@@ -281,7 +282,7 @@ namespace SwarmTest
                         }
                     }
             delta[i] = d;
-            nWorm[i] = nAcc;
+            nPile[i] = nAcc;
             contact[i] = hit;
             checks[i] = chk;
         }
@@ -320,8 +321,9 @@ namespace SwarmTest
                     q = cl + nLocal * r;
                 }
                 else
-                {   // centre inside the box: leave through the nearest face
+                {   // centre inside the box: leave through the nearest face, but never downward (that traps it against the floor)
                     float3 pen = bx.he - abs(q);
+                    if (q.y < 0f) pen.y = float.MaxValue;
                     if (pen.y <= pen.x && pen.y <= pen.z) { nLocal = new float3(0, sign(q.y), 0); q.y = nLocal.y * (bx.he.y + r); }
                     else if (pen.x <= pen.z) { nLocal = new float3(sign(q.x), 0, 0); q.x = nLocal.x * (bx.he.x + r); }
                     else { nLocal = new float3(0, 0, sign(q.z)); q.z = nLocal.z * (bx.he.z + r); }
@@ -341,9 +343,10 @@ namespace SwarmTest
     public struct ChainJob : IJobParallelFor
     {
         [NativeDisableParallelForRestriction] public NativeArray<float3> pos;
-        public int K; public float segLen, bendStiffness, minFoldRatio;
+        [ReadOnly] public NativeArray<float> restLen, restBend;
+        public int K; public float bendStiffness, minFoldRatio;
 
-        public void Execute(int w) { SwarmMath.SolveChain(pos, w * K, K, segLen, bendStiffness, minFoldRatio); }
+        public void Execute(int w) { SwarmMath.SolveChain(pos, w * K, K, restLen, restBend, bendStiffness, minFoldRatio); }
     }
 
     [BurstCompile]
@@ -351,6 +354,7 @@ namespace SwarmTest
     {
         [ReadOnly] public NativeArray<float3> pos, snap, heading;
         [ReadOnly] public NativeArray<quaternion> restOffset;
+        [ReadOnly] public NativeArray<float> lift;
         [NativeDisableParallelForRestriction] public NativeArray<float3> bonePos;
         [NativeDisableParallelForRestriction] public NativeArray<quaternion> boneRot;
         public int K, B; public float alpha;
@@ -359,11 +363,12 @@ namespace SwarmTest
         {
             int b = w * K, o = w * B;
             float3 up = new float3(0, 1, 0);
-            float3 p0 = lerp(snap[b], pos[b], alpha);
+            // particles sit on the ground at their collision radius; lift raises each joint back to its modelled height
+            float3 p0 = lerp(snap[b], pos[b], alpha) + new float3(0, lift[0], 0);
             quaternion rot = Unity.Mathematics.quaternion.identity;
             for (int k = 0; k < B; k++)
             {
-                float3 p1 = lerp(snap[b + k + 1], pos[b + k + 1], alpha);
+                float3 p1 = lerp(snap[b + k + 1], pos[b + k + 1], alpha) + new float3(0, lift[k + 1], 0);
                 float3 dir = p1 - p0;
                 if (lengthsq(dir) > 1e-10f)
                 {

@@ -7,16 +7,19 @@ using UnityEngine.Jobs;
 
 namespace SwarmTest
 {
-    public class WormSwarm : MonoBehaviour
+    public class CreatureSwarm : MonoBehaviour
     {
         [Header("Swarm")]
-        public GameObject wormPrefab;
-        [Min(0)] public int maxWorms = 300;
+        [Tooltip("Swap this (even in Play mode) to respawn the swarm as another creature")]
+        public CreatureProfile creature;
+        [Min(0)] public int maxCount = 300;
         public float spawnPerSecond = 60f;
         public Transform spawnPoint;
         public float spawnRadius = 2f;
         public Vector2 spawnHeight = new Vector2(0.15f, 0.6f);
         public Transform target;
+        [Tooltip("Inside this radius creatures ignore the flow field and mill around the target")]
+        public float arriveRadius = 0.7f;
 
         [Header("Flow Field")]
         public Vector3 areaCenter = Vector3.zero;
@@ -27,57 +30,32 @@ namespace SwarmTest
         public float maxClimbHeight = 0.6f;
         public float obstacleInflate = 0.05f;
 
-        [Header("Locomotion")]
-        public float crawlSpeed = 0.55f;
-        [Range(0f, 0.5f)] public float speedVariation = 0.25f;
-        [Tooltip("Degrees per second")]
-        public float turnRate = 160f;
-        [Tooltip("Degrees")]
-        public float wiggleAmplitude = 30f;
-        public float wiggleFrequency = 1.4f;
-        [Range(0f, 1f)] public float wanderStrength = 0.3f;
-        [Tooltip("Inside this radius worms ignore the flow field and mill around the target")]
-        public float arriveRadius = 0.7f;
-        public float climbStrength = 1.0f;
-        [Tooltip("Climbing over other worms: lower = flatter swarm, higher = taller mounds")]
-        public float wormClimbStrength = 0.35f;
-        [Tooltip("Touching body segments push themselves along the path toward the head")]
-        [Range(0f, 1.5f)] public float bodyThrust = 0.6f;
-
         [Header("Physics")]
         public Vector3 gravity = new Vector3(0f, -9.81f, 0f);
         [Range(1, 6)] public int substeps = 2;
         [Range(1, 12)] public int constraintIterations = 4;
         [Range(0f, 1f)] public float airDamping = 0.01f;
-        [Range(0f, 1f)] public float lateralFriction = 0.5f;
-        [Range(0f, 1f)] public float forwardFriction = 0.08f;
-        [Range(0f, 1f)] public float bendStiffness = 0.08f;
-        [Range(0.1f, 1f)] public float minFoldRatio = 0.55f;
-        [Range(0f, 1f)] public float wormCollisionStiffness = 0.8f;
-        [Tooltip("Friction while resting only on other worms; low keeps piles flowing")]
-        [Range(0f, 1f)] public float wormFriction = 0.12f;
         [Tooltip("Only BoxColliders on these layers are collided with")]
         public LayerMask environmentMask = ~(1 << 2);
-
-        [Header("Rig")]
-        public string bonePrefix = "Spine_";
-        public int boneCount = 10;
 
         [Header("Debug")]
         public bool showHud = true;
         public bool showFlowField = true;
         public bool showParticles = false;
 
-        // particle i of worm w lives at index w * K + i
+        // particle k of creature c lives at index c * K + k
         int K, B;
-        NativeArray<float3> pos, prev, snap, delta, nLevel, nWorm;
+        NativeArray<float3> pos, prev, snap, delta, nLevel, nPile;
         NativeArray<float> rad;
         NativeArray<byte> contact, onLevel;
         NativeArray<int> cellHash, sorted, checks;
         NativeArray<int> hashCount, hashStart;
         int tableSize;
-        float segLen, hashCell;
-        float[] restRadius;
+        float hashCell;
+
+        NativeArray<float> restLen, restBend, lift;
+        Vector3[] restShape;   // rest particle positions relative to the head, facing +Z
+        float[] jointRadius;
 
         int count, capacity;
         NativeArray<float3> heading, moveDir;
@@ -87,14 +65,15 @@ namespace SwarmTest
         NativeArray<float3> bonePos;
         NativeArray<quaternion> boneRot;
         TransformAccessArray boneTransforms;
-        readonly List<Transform[]> wormBones = new List<Transform[]>();
-        readonly List<GameObject> wormObjects = new List<GameObject>();
+        readonly List<Transform[]> creatureBones = new List<Transform[]>();
+        readonly List<GameObject> creatureObjects = new List<GameObject>();
 
         NativeArray<LevelBox> boxes;
         NativeArray<float3> flowDir;
         public FlowField Field { get; private set; }
         public int Count { get { return count; } }
 
+        CreatureProfile active;
         float spawnAccumulator;
 
         readonly System.Diagnostics.Stopwatch simWatch = new System.Diagnostics.Stopwatch();
@@ -103,28 +82,16 @@ namespace SwarmTest
 
         void Start()
         {
-            if (wormPrefab == null) { Debug.LogError("[WormSwarm] No worm prefab", this); enabled = false; return; }
-            B = boneCount;
-            K = boneCount + 1;
-            CaptureRestPose();
             Field = new FlowField(areaCenter, areaSize, cellSize);
             flowDir = new NativeArray<float3>(Field.dir.Length, Allocator.Persistent);
             RebakeObstacles();
-            boneTransforms = new TransformAccessArray(Mathf.Max(16, maxWorms) * B);
-            EnsureCapacity(Mathf.Max(16, maxWorms));
+            Activate(creature);
         }
 
         void OnDestroy()
         {
-            Dispose(ref pos); Dispose(ref prev); Dispose(ref snap); Dispose(ref delta);
-            Dispose(ref nLevel); Dispose(ref nWorm); Dispose(ref rad);
-            Dispose(ref contact); Dispose(ref onLevel);
-            Dispose(ref cellHash); Dispose(ref sorted); Dispose(ref checks);
-            Dispose(ref hashCount); Dispose(ref hashStart);
-            Dispose(ref heading); Dispose(ref moveDir); Dispose(ref phase); Dispose(ref speedMul); Dispose(ref seed);
-            Dispose(ref restOffset); Dispose(ref bonePos); Dispose(ref boneRot);
+            DisposeCreatureData();
             Dispose(ref boxes); Dispose(ref flowDir);
-            if (boneTransforms.isCreated) boneTransforms.Dispose();
         }
 
         static void Dispose<T>(ref NativeArray<T> a) where T : struct { if (a.IsCreated) a.Dispose(); }
@@ -140,45 +107,113 @@ namespace SwarmTest
             a = na;
         }
 
-        void CaptureRestPose()
+        void DisposeCreatureData()
         {
-            GameObject probe = Instantiate(wormPrefab, Vector3.zero, Quaternion.identity);
-            Transform[] b = FindBones(probe.transform);
-            Vector3[] p = new Vector3[K];
-            for (int i = 0; i < B; i++) p[i] = b[i].position;
-            segLen = Vector3.Distance(p[0], p[1]);
-            p[K - 1] = p[K - 2] + (p[K - 2] - p[K - 3]).normalized * segLen;
+            Dispose(ref pos); Dispose(ref prev); Dispose(ref snap); Dispose(ref delta);
+            Dispose(ref nLevel); Dispose(ref nPile); Dispose(ref rad);
+            Dispose(ref contact); Dispose(ref onLevel);
+            Dispose(ref cellHash); Dispose(ref sorted); Dispose(ref checks);
+            Dispose(ref hashCount); Dispose(ref hashStart);
+            Dispose(ref heading); Dispose(ref moveDir); Dispose(ref phase); Dispose(ref speedMul); Dispose(ref seed);
+            Dispose(ref restOffset); Dispose(ref bonePos); Dispose(ref boneRot);
+            Dispose(ref restLen); Dispose(ref restBend); Dispose(ref lift);
+            if (boneTransforms.isCreated) boneTransforms.Dispose();
+            capacity = 0;
+        }
+
+        void Activate(CreatureProfile p)
+        {
+            foreach (var go in creatureObjects) if (go != null) Destroy(go);
+            creatureObjects.Clear();
+            creatureBones.Clear();
+            count = 0;
+            spawnAccumulator = 0f;
+            DisposeCreatureData();
+            active = p;
+            if (p == null || p.prefab == null) return;
+
+            B = p.boneCount;
+            K = B + 1;
+            if (!CaptureRestPose(p)) { active = null; return; }
+            boneTransforms = new TransformAccessArray(Mathf.Max(16, maxCount) * B);
+            EnsureCapacity(Mathf.Max(16, maxCount));
+        }
+
+        bool CaptureRestPose(CreatureProfile p)
+        {
+            GameObject probe = Instantiate(p.prefab, Vector3.zero, Quaternion.identity);
+            Transform[] b = FindBones(probe.transform, p);
+            if (b == null) { Destroy(probe); return false; }
+
+            // lowest point of the mesh = the ground the creature stands on
+            float ground = float.MaxValue;
+            var smrs = probe.GetComponentsInChildren<SkinnedMeshRenderer>();
+            var verts = new List<Vector3>();
+            foreach (var smr in smrs)
+            {
+                smr.sharedMesh.GetVertices(verts);
+                foreach (var v in verts) ground = Mathf.Min(ground, smr.transform.TransformPoint(v).y);
+            }
+            if (ground == float.MaxValue) ground = 0f;
+
+            Vector3[] j = new Vector3[K];
+            for (int i = 0; i < B; i++) j[i] = b[i].position;
+
+            // tail tip: the last bone has no end in the FBX, so take the furthest vertex along its direction
+            Vector3 lastDir = (j[B - 1] - j[B - 2]).normalized;
+            float tip = 0f;
+            foreach (var smr in smrs)
+            {
+                smr.sharedMesh.GetVertices(verts);
+                foreach (var v in verts) tip = Mathf.Max(tip, Vector3.Dot(smr.transform.TransformPoint(v) - j[B - 1], lastDir));
+            }
+            j[K - 1] = j[B - 1] + lastDir * Mathf.Max(tip, 0.01f);
+
+            jointRadius = new float[K];
+            for (int k = 0; k < K; k++)
+                jointRadius[k] = (p.jointRadius != null && k < p.jointRadius.Length) ? p.jointRadius[k] : 0.03f;
+            if (p.jointRadius == null || p.jointRadius.Length != K)
+                Debug.LogWarning("[CreatureSwarm] " + p.name + " needs " + K + " joint radii", p);
+
+            // simulated particles rest on the ground at their radius; lift restores the modelled height when rendering
+            Vector3[] s = new Vector3[K];
+            lift = new NativeArray<float>(K, Allocator.Persistent);
+            float maxR = 0f;
+            for (int k = 0; k < K; k++)
+            {
+                float l = Mathf.Max(0f, (j[k].y - ground) - jointRadius[k]);
+                lift[k] = l;
+                s[k] = j[k] - Vector3.up * l;
+                maxR = Mathf.Max(maxR, jointRadius[k]);
+            }
+            restShape = new Vector3[K];
+            for (int k = 0; k < K; k++) restShape[k] = s[k] - s[0];
+            restLen = new NativeArray<float>(K - 1, Allocator.Persistent);
+            restBend = new NativeArray<float>(K - 2, Allocator.Persistent);
+            for (int k = 0; k < K - 1; k++) restLen[k] = Vector3.Distance(s[k], s[k + 1]);
+            for (int k = 0; k < K - 2; k++) restBend[k] = Vector3.Distance(s[k], s[k + 2]);
 
             // bone rotation relative to an (along-body, world-up) frame, so it can be rebuilt from the chain
             restOffset = new NativeArray<quaternion>(B, Allocator.Persistent);
             for (int i = 0; i < B; i++)
-            {
-                Vector3 d = (p[i + 1] - p[i]).normalized;
-                restOffset[i] = Quaternion.Inverse(Quaternion.LookRotation(d, Vector3.up)) * b[i].rotation;
-            }
-            restRadius = new float[K];
-            for (int k = 0; k < K; k++) restRadius[k] = BodyRadius(k * segLen);
-            hashCell = 2f * 0.05f;
+                restOffset[i] = Quaternion.Inverse(Quaternion.LookRotation((j[i + 1] - j[i]).normalized, Vector3.up)) * b[i].rotation;
+
+            hashCell = 2f * maxR;
             Destroy(probe);
+            return true;
         }
 
-        // matches the taper of the Blender mesh
-        static float BodyRadius(float s)
-        {
-            const float maxR = 0.05f, bodyR = 0.047f, tipR = 0.006f, taperStart = 0.55f, length = 1.2f;
-            if (s < 0.06f) return Mathf.Lerp(0.035f, maxR, s / 0.06f);
-            if (s < taperStart) return bodyR;
-            float k = Mathf.Clamp01((s - taperStart) / (length - taperStart));
-            return Mathf.Max(0.012f, tipR + (bodyR - tipR) * (1f - k) * (1f + 0.6f * k));
-        }
-
-        Transform[] FindBones(Transform root)
+        Transform[] FindBones(Transform root, CreatureProfile p)
         {
             var b = new Transform[B];
             for (int i = 0; i < B; i++)
             {
-                b[i] = FindDeep(root, bonePrefix + i.ToString("00"));
-                if (b[i] == null) Debug.LogError("[WormSwarm] Missing bone " + bonePrefix + i.ToString("00"));
+                b[i] = FindDeep(root, p.bonePrefix + i.ToString("00"));
+                if (b[i] == null)
+                {
+                    Debug.LogError("[CreatureSwarm] " + p.prefab.name + " is missing bone " + p.bonePrefix + i.ToString("00"), p);
+                    return null;
+                }
             }
             return b;
         }
@@ -201,17 +236,17 @@ namespace SwarmTest
             {
                 if (!bc.enabled || bc.isTrigger || ((1 << bc.gameObject.layer) & environmentMask) == 0) continue;
                 Transform t = bc.transform;
-                Vector3 s = t.lossyScale;
+                Vector3 sc = t.lossyScale;
                 Bounds aabb = bc.bounds;
                 aabb.Expand(0.12f);
-                LevelBox b;
-                b.c = t.TransformPoint(bc.center);
-                b.he = new float3(Mathf.Abs(bc.size.x * s.x), Mathf.Abs(bc.size.y * s.y), Mathf.Abs(bc.size.z * s.z)) * 0.5f;
-                b.rot = t.rotation;
-                b.inv = math.inverse(b.rot);
-                b.aMin = aabb.min;
-                b.aMax = aabb.max;
-                list.Add(b);
+                LevelBox lb;
+                lb.c = t.TransformPoint(bc.center);
+                lb.he = new float3(Mathf.Abs(bc.size.x * sc.x), Mathf.Abs(bc.size.y * sc.y), Mathf.Abs(bc.size.z * sc.z)) * 0.5f;
+                lb.rot = t.rotation;
+                lb.inv = math.inverse(lb.rot);
+                lb.aMin = aabb.min;
+                lb.aMax = aabb.max;
+                list.Add(lb);
             }
             Dispose(ref boxes);
             boxes = new NativeArray<LevelBox>(list.ToArray(), Allocator.Persistent);
@@ -228,13 +263,13 @@ namespace SwarmTest
 
         void CopyFlow() { flowDir.Reinterpret<Vector3>().CopyFrom(Field.dir); }
 
-        void EnsureCapacity(int worms)
+        void EnsureCapacity(int n)
         {
-            if (worms <= capacity) return;
-            int newCap = Mathf.Max(worms, capacity * 2);
+            if (n <= capacity) return;
+            int newCap = Mathf.Max(n, capacity * 2);
             int P = newCap * K;
             Grow(ref pos, P); Grow(ref prev, P); Grow(ref snap, P); Grow(ref delta, P);
-            Grow(ref nLevel, P); Grow(ref nWorm, P); Grow(ref rad, P);
+            Grow(ref nLevel, P); Grow(ref nPile, P); Grow(ref rad, P);
             Grow(ref contact, P); Grow(ref onLevel, P);
             Grow(ref cellHash, P); Grow(ref sorted, P); Grow(ref checks, P);
             Grow(ref heading, newCap); Grow(ref moveDir, newCap);
@@ -248,78 +283,82 @@ namespace SwarmTest
             capacity = newCap;
         }
 
-        void SpawnWorm()
+        void Spawn()
         {
             EnsureCapacity(count + 1);
-            int w = count++;
+            int c = count++;
 
-            if (wormObjects.Count <= w)
+            if (creatureObjects.Count <= c)
             {
                 // root-level on purpose: IJobParallelForTransform only parallelises across root hierarchies
-                GameObject go = Instantiate(wormPrefab, Vector3.zero, Quaternion.identity);
-                go.name = "Worm_" + w.ToString("0000");
+                GameObject go = Instantiate(active.prefab, Vector3.zero, Quaternion.identity);
+                go.name = active.prefab.name + "_" + c.ToString("0000");
                 var anim = go.GetComponent<Animator>();
                 if (anim != null) Destroy(anim);
                 foreach (var smr in go.GetComponentsInChildren<SkinnedMeshRenderer>()) smr.updateWhenOffscreen = true;
-                Transform[] bones = FindBones(go.transform);
+                Transform[] bones = FindBones(go.transform, active);
                 // flatten the bone chain so each bone's world pose can be written independently
                 Transform rig = bones[0].parent;
                 for (int k = 1; k < B; k++) bones[k].SetParent(rig, true);
-                wormObjects.Add(go);
-                wormBones.Add(bones);
+                creatureObjects.Add(go);
+                creatureBones.Add(bones);
             }
-            wormObjects[w].SetActive(true);
-            if (boneTransforms.length == w * B)
-                foreach (var t in wormBones[w]) boneTransforms.Add(t);
+            creatureObjects[c].SetActive(true);
+            if (boneTransforms.length == c * B)
+                foreach (var t in creatureBones[c]) boneTransforms.Add(t);
 
             Vector3 basePos = spawnPoint != null ? spawnPoint.position : transform.position;
-            Vector3 fwd = Vector3.forward, head = basePos;
+            Quaternion yaw = Quaternion.identity;
+            Vector3 head = basePos;
             for (int attempt = 0; attempt < 12; attempt++)
             {
                 Vector2 disc = UnityEngine.Random.insideUnitCircle * spawnRadius;
-                fwd = Quaternion.Euler(0f, UnityEngine.Random.Range(0f, 360f), 0f) * Vector3.forward;
+                yaw = Quaternion.Euler(0f, UnityEngine.Random.Range(0f, 360f), 0f);
                 head = basePos + new Vector3(disc.x, UnityEngine.Random.Range(spawnHeight.x, spawnHeight.y), disc.y);
-                Vector3 tail = head - fwd * (segLen * (K - 1));
-                if (!Physics.CheckCapsule(head, tail, 0.06f, environmentMask, QueryTriggerInteraction.Ignore)) break;
+                if (!Physics.CheckCapsule(head, head + yaw * restShape[K - 1], 0.06f, environmentMask, QueryTriggerInteraction.Ignore)) break;
             }
 
             for (int k = 0; k < K; k++)
             {
-                int i = w * K + k;
-                float3 p = head - fwd * (k * segLen);
+                int i = c * K + k;
+                float3 p = head + yaw * restShape[k];
                 pos[i] = p; prev[i] = p; snap[i] = p;
-                rad[i] = restRadius[k];
+                rad[i] = jointRadius[k];
                 contact[i] = 0; onLevel[i] = 0;
-                nLevel[i] = float3.zero; nWorm[i] = float3.zero;
+                nLevel[i] = float3.zero; nPile[i] = float3.zero;
             }
-            heading[w] = fwd;
-            moveDir[w] = fwd;
-            phase[w] = UnityEngine.Random.Range(0f, 10f);
-            speedMul[w] = 1f + UnityEngine.Random.Range(-speedVariation, speedVariation);
-            seed[w] = UnityEngine.Random.Range(0f, 1000f);
+            Vector3 fwd = yaw * Vector3.forward;
+            heading[c] = fwd;
+            moveDir[c] = fwd;
+            phase[c] = UnityEngine.Random.Range(0f, 10f);
+            speedMul[c] = 1f + UnityEngine.Random.Range(-active.speedVariation, active.speedVariation);
+            seed[c] = UnityEngine.Random.Range(0f, 1000f);
         }
 
         void UpdatePopulation(float dt)
         {
-            if (count > maxWorms)
+            if (count > maxCount)
             {
-                for (int w = maxWorms; w < count; w++) wormObjects[w].SetActive(false);
-                count = maxWorms;
-                // bone transforms must stay in worm order and hold only live worms
+                for (int c = maxCount; c < count; c++) creatureObjects[c].SetActive(false);
+                count = maxCount;
+                // bone transforms must stay in creature order and hold only live creatures
                 boneTransforms.Dispose();
                 boneTransforms = new TransformAccessArray(Mathf.Max(16, capacity * B));
-                for (int w = 0; w < count; w++) foreach (var t in wormBones[w]) boneTransforms.Add(t);
+                for (int c = 0; c < count; c++) foreach (var t in creatureBones[c]) boneTransforms.Add(t);
             }
-            if (count < maxWorms)
+            if (count < maxCount)
             {
                 spawnAccumulator += spawnPerSecond * dt;
-                while (spawnAccumulator >= 1f && count < maxWorms) { SpawnWorm(); spawnAccumulator -= 1f; }
+                while (spawnAccumulator >= 1f && count < maxCount) { Spawn(); spawnAccumulator -= 1f; }
             }
             else spawnAccumulator = 0f;
         }
 
         void FixedUpdate()
         {
+            if (creature != active) Activate(creature);
+            if (active == null) return;
+
             float dt = Time.fixedDeltaTime;
             UpdatePopulation(dt);
             if (target != null && Field.Build(target.position)) CopyFlow();
@@ -328,6 +367,7 @@ namespace SwarmTest
             simWatch.Reset(); simWatch.Start();
             int P = count * K;
             NativeArray<float3>.Copy(pos, snap, P);
+            CreatureProfile cp = active;
 
             JobHandle dep = new SteerJob
             {
@@ -336,8 +376,8 @@ namespace SwarmTest
                 K = K, flowOrigin = Field.origin, cellSize = Field.cellSize, fw = Field.width, fh = Field.height,
                 hasTarget = target != null, target = target != null ? (float3)target.position : float3.zero,
                 arriveRadius = arriveRadius, time = Time.time, dt = dt,
-                maxTurn = turnRate * Mathf.Deg2Rad * dt, wanderStrength = wanderStrength,
-                wiggleFreq = wiggleFrequency, wiggleAmp = wiggleAmplitude * Mathf.Deg2Rad
+                maxTurn = cp.turnRate * Mathf.Deg2Rad * dt, wanderStrength = cp.wanderStrength,
+                wiggleFreq = cp.wiggleFrequency, wiggleAmp = cp.wiggleAmplitude * Mathf.Deg2Rad
             }.Schedule(count, 16);
 
             float h = dt / substeps;
@@ -345,16 +385,17 @@ namespace SwarmTest
             int mask = tableSize - 1;
             for (int s = 0; s < substeps; s++)
             {
-                dep = new WormStepJob
+                dep = new StepJob
                 {
                     pos = pos, prev = prev, contact = contact, onLevel = onLevel,
-                    nLevel = nLevel, nWorm = nWorm, moveDir = moveDir, speedMul = speedMul,
-                    K = K, iterations = constraintIterations, h = h, segLen = segLen,
-                    bendStiffness = bendStiffness, minFoldRatio = minFoldRatio, gravity = gravity,
-                    keepAir = 1f - airDamping, keepSide = 1f - lateralFriction,
-                    keepFwd = 1f - forwardFriction, keepWorm = 1f - wormFriction,
-                    crawlSpeed = crawlSpeed, bodyThrust = bodyThrust, climbStrength = climbStrength,
-                    wormClimbStrength = wormClimbStrength, floorY = areaCenter.y, maxClimbHeight = maxClimbHeight
+                    nLevel = nLevel, nPile = nPile, moveDir = moveDir, speedMul = speedMul,
+                    restLen = restLen, restBend = restBend,
+                    K = K, iterations = constraintIterations, h = h,
+                    bendStiffness = cp.bendStiffness, minFoldRatio = cp.minFoldRatio, gravity = gravity,
+                    keepAir = 1f - airDamping, keepSide = 1f - cp.lateralFriction,
+                    keepFwd = 1f - cp.forwardFriction, keepPile = 1f - cp.pileFriction,
+                    moveSpeed = cp.moveSpeed, bodyThrust = cp.bodyThrust, climbStrength = cp.climbStrength,
+                    pileClimbStrength = cp.pileClimbStrength, floorY = areaCenter.y, maxClimbHeight = maxClimbHeight
                 }.Schedule(count, 8, dep);
 
                 dep = new HashJob { pos = pos, cellHash = cellHash, invCell = invCell, mask = mask }.Schedule(P, 128, dep);
@@ -363,8 +404,8 @@ namespace SwarmTest
                 dep = new CollideJob
                 {
                     pos = pos, rad = rad, sorted = sorted, hashStart = hashStart, hashCount = hashCount,
-                    delta = delta, nWorm = nWorm, contact = contact, checks = checks,
-                    K = K, mask = mask, invCell = invCell, stiff = 0.5f * wormCollisionStiffness
+                    delta = delta, nPile = nPile, contact = contact, checks = checks,
+                    K = K, mask = mask, invCell = invCell, stiff = 0.5f * cp.collisionStiffness
                 }.Schedule(P, 64, dep);
 
                 dep = new LevelCollideJob
@@ -373,8 +414,11 @@ namespace SwarmTest
                     contact = contact, onLevel = onLevel, nLevel = nLevel
                 }.Schedule(P, 64, dep);
 
-                dep = new ChainJob { pos = pos, K = K, segLen = segLen, bendStiffness = bendStiffness, minFoldRatio = minFoldRatio }
-                    .Schedule(count, 8, dep);
+                dep = new ChainJob
+                {
+                    pos = pos, restLen = restLen, restBend = restBend, K = K,
+                    bendStiffness = cp.bendStiffness, minFoldRatio = cp.minFoldRatio
+                }.Schedule(count, 8, dep);
             }
             dep.Complete();
             simWatch.Stop();
@@ -383,13 +427,13 @@ namespace SwarmTest
 
         void LateUpdate()
         {
-            if (!pos.IsCreated || count == 0) return;
+            if (active == null || !pos.IsCreated || count == 0) return;
             // interpolate between the last two physics steps for smooth motion at any frame rate
             float a = Mathf.Clamp01((Time.time - Time.fixedTime) / Time.fixedDeltaTime);
 
             JobHandle h = new BonePoseJob
             {
-                pos = pos, snap = snap, heading = heading, restOffset = restOffset,
+                pos = pos, snap = snap, heading = heading, restOffset = restOffset, lift = lift,
                 bonePos = bonePos, boneRot = boneRot, K = K, B = B, alpha = a
             }.Schedule(count, 16);
             h = new ApplyBonesJob { bonePos = bonePos, boneRot = boneRot }.Schedule(boneTransforms, h);
@@ -410,9 +454,10 @@ namespace SwarmTest
             pairs /= 2; // each pair is counted from both sides
             long brute = P * (P - 1) / 2;
             hudText = string.Format(
-                "FPS {0:0}   [Jobs + Burst, {10} threads]\nWorms {1} / {2}   particles {3}\nSim {4:0.00} ms / step\nPair checks/substep {5:N0}\n(brute force would be {6:N0})\nFlow field {7}x{8}  rebuild {9:0.00} ms",
-                fpsSmoothed, count, maxWorms, P, simMs, pairs, brute,
-                Field.width, Field.height, Field.LastBuildMs, Unity.Jobs.LowLevel.Unsafe.JobsUtility.JobWorkerCount + 1);
+                "FPS {0:0}   [Jobs + Burst, {10} threads]\n{11} {1} / {2}   particles {3}\nSim {4:0.00} ms / step\nPair checks/substep {5:N0}\n(brute force would be {6:N0})\nFlow field {7}x{8}  rebuild {9:0.00} ms",
+                fpsSmoothed, count, maxCount, P, simMs, pairs, brute,
+                Field.width, Field.height, Field.LastBuildMs, Unity.Jobs.LowLevel.Unsafe.JobsUtility.JobWorkerCount + 1,
+                active != null ? active.name : "-");
         }
 
         GUIStyle hudStyle;

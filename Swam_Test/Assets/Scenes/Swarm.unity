@@ -787,7 +787,7 @@ GameObject:
   - component: {fileID: 998443544}
   - component: {fileID: 998443543}
   m_Layer: 0
-  m_Name: WormSwarm
+  m_Name: Swarm
   m_TagString: Untagged
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
@@ -805,13 +805,14 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: a2e06bb3be2c05b4ab3a23f178eaa1ba, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  wormPrefab: {fileID: 919132149155446097, guid: 329e564fe7f672645ba531201507cc3d, type: 3}
-  maxWorms: 500
+  creature: {fileID: 11400000, guid: 8f3ede879bfa5b744baea4d65fa02ec7, type: 2}
+  maxCount: 300
   spawnPerSecond: 100
   spawnPoint: {fileID: 1755198358}
-  spawnRadius: 2.2
+  spawnRadius: 1.5
   spawnHeight: {x: 0.15, y: 0.6}
   target: {fileID: 607309097}
+  arriveRadius: 0.7
   areaCenter: {x: 0, y: 0, z: 0}
   areaSize: {x: 14, y: 14}
   cellSize: 0.25
@@ -820,31 +821,13 @@ MonoBehaviour:
     m_Bits: 51
   maxClimbHeight: 0.6
   obstacleInflate: 0.05
-  crawlSpeed: 0.55
-  speedVariation: 0.25
-  turnRate: 160
-  wiggleAmplitude: 30
-  wiggleFrequency: 1.4
-  wanderStrength: 0.3
-  arriveRadius: 0.7
-  climbStrength: 1
-  wormClimbStrength: 0.35
-  bodyThrust: 0.6
   gravity: {x: 0, y: -9.81, z: 0}
   substeps: 2
   constraintIterations: 4
   airDamping: 0.01
-  lateralFriction: 0.5
-  forwardFriction: 0.08
-  bendStiffness: 0.08
-  minFoldRatio: 0.55
-  wormCollisionStiffness: 0.8
-  wormFriction: 0.12
   environmentMask:
     serializedVersion: 2
     m_Bits: 51
-  bonePrefix: Spine_
-  boneCount: 10
   showHud: 1
   showFlowField: 1
   showParticles: 0
