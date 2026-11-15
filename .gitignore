@@ -6,7 +6,8 @@
 # See: https://github.com/github/gitignore/tree/main/Global
 #
 .utmp/
-/[Ll]ibrary/
+# Unity cache: ignore Library folders at any depth
+[Ll]ibrary/
 /[Tt]emp/
 /[Oo]bj/
 /[Bb]uild/
@@ -107,3 +108,8 @@ InitTestScene*.unity*
 
 # Auto-generated cache in Assets folder
 /[Aa]ssets/[Ss]ceneDependencyCache*
+
+# Gitignore patterns cannot filter files by size.
+# Add explicit repository-relative paths for files larger than 100 MB below.
+# Already tracked files must also be removed from the Git index (not disk).
+# Large files (explicit paths):
