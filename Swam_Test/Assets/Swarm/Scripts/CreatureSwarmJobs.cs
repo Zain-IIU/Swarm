@@ -68,6 +68,11 @@ namespace SwarmTest
         [ReadOnly] public NativeArray<float> seed, speedMul;
         public NativeArray<float3> heading, moveDir;
         public NativeArray<float> phase;
+        [ReadOnly] public NativeArray<float4> repellers;   // x, z, radius, fear margin
+        [WriteOnly] public NativeArray<float> panic;
+        public float fleeBoost;
+        public float2 areaMin, areaMax;
+        public float edgeMargin;
 
         public int K;
         public float3 flowOrigin; public float cellSize; public int fw, fh;
@@ -92,7 +97,35 @@ namespace SwarmTest
             float n = noise.cnoise(new float2(seed[w], time * 0.35f));
             desired = SwarmMath.RotY(desired, n * wanderStrength * radians(90f) * (near ? 2f : 1f));
 
-            float3 hd = SwarmMath.RotateTowards(heading[w], desired, maxTurn);
+            // fear: inside a repeller's margin, steer away from its centre (strongest at the radius)
+            float fear = 0f;
+            float3 away = default(float3);
+            for (int r = 0; r < repellers.Length; r++)
+            {
+                float4 rp = repellers[r];
+                float2 d = hp.xz - rp.xy;
+                float dl = length(d);
+                float outer = rp.z + rp.w;
+                if (dl >= outer) continue;
+                float k = saturate((outer - dl) / max(rp.w, 1e-3f));
+                float2 dir2 = dl > 1e-4f ? d / dl : new float2(1f, 0f);
+                away += new float3(dir2.x, 0f, dir2.y) * k;
+                fear = max(fear, k);
+            }
+            if (fear > 0f) desired = normalizesafe(desired * (1f - fear) + normalizesafe(away) * (2f * fear), desired);
+
+            // keep away from the edge of the flow-field area
+            float2 inward = default(float2);
+            inward.x += saturate((areaMin.x + edgeMargin - hp.x) / edgeMargin) - saturate((hp.x - (areaMax.x - edgeMargin)) / edgeMargin);
+            inward.y += saturate((areaMin.y + edgeMargin - hp.z) / edgeMargin) - saturate((hp.z - (areaMax.y - edgeMargin)) / edgeMargin);
+            float edge = length(inward);
+            if (edge > 1e-4f)
+            {
+                desired = normalizesafe(desired + new float3(inward.x, 0f, inward.y) * 2f, desired);
+            }
+            panic[w] = 1f + fleeBoost * fear;
+
+            float3 hd = SwarmMath.RotateTowards(heading[w], desired, maxTurn * (1f + 2f * max(fear, saturate(edge))));
             hd.y = 0f;
             hd = normalizesafe(hd, new float3(0, 0, 1));
             heading[w] = hd;
@@ -126,7 +159,7 @@ namespace SwarmTest
         [NativeDisableParallelForRestriction] public NativeArray<float3> prev;
         [ReadOnly] public NativeArray<byte> contact, onLevel;
         [ReadOnly] public NativeArray<float3> nLevel, nPile, moveDir;
-        [ReadOnly] public NativeArray<float> speedMul, restLen, restBend;
+        [ReadOnly] public NativeArray<float> speedMul, restLen, restBend, panic;
 
         public int K, iterations;
         public float h, bendStiffness, minFoldRatio;
@@ -160,7 +193,7 @@ namespace SwarmTest
                 pos[i] += v + g;
             }
 
-            float step = moveSpeed * speedMul[w] * h;
+            float step = moveSpeed * speedMul[w] * panic[w] * h;
             if (contact[b] != 0 || contact[b + 1] != 0)
             {
                 float3 md = moveDir[w];
@@ -292,12 +325,15 @@ namespace SwarmTest
     public struct LevelCollideJob : IJobParallelFor
     {
         public NativeArray<float3> pos;
-        [ReadOnly] public NativeArray<float3> delta;
+        [ReadOnly] public NativeArray<float3> delta, prev;
         [ReadOnly] public NativeArray<float> rad;
         [ReadOnly] public NativeArray<LevelBox> boxes;
         public NativeArray<byte> contact;
         [WriteOnly] public NativeArray<byte> onLevel;
         [WriteOnly] public NativeArray<float3> nLevel;
+        [ReadOnly] public NativeArray<float4> repellers;
+        public float maxRepelPush;
+        public float2 areaMin, areaMax;
 
         public void Execute(int i)
         {
@@ -305,6 +341,23 @@ namespace SwarmTest
             float r = rad[i];
             byte lv = 0;
             float3 nl = default(float3);
+
+            // repellers are vertical cylinders nothing may enter; push out at a capped speed so creatures scatter instead of teleporting
+            for (int k = 0; k < repellers.Length; k++)
+            {
+                float4 rp = repellers[k];
+                float2 d = p.xz - rp.xy;
+                float minD = rp.z + r;
+                float d2 = lengthsq(d);
+                if (d2 >= minD * minD) continue;
+                float dl = sqrt(d2);
+                float2 n = dl > 1e-5f ? d / dl : new float2(1f, 0f);
+                p.xz += n * min(minD - dl, maxRepelPush);
+            }
+
+            // the flow-field area is a hard boundary
+            p.x = clamp(p.x, areaMin.x + r, areaMax.x - r);
+            p.z = clamp(p.z, areaMin.y + r, areaMax.y - r);
             for (int b = 0; b < boxes.Length; b++)
             {
                 LevelBox bx = boxes[b];
@@ -321,12 +374,24 @@ namespace SwarmTest
                     q = cl + nLocal * r;
                 }
                 else
-                {   // centre inside the box: leave through the nearest face, but never downward (that traps it against the floor)
-                    float3 pen = bx.he - abs(q);
-                    if (q.y < 0f) pen.y = float.MaxValue;
-                    if (pen.y <= pen.x && pen.y <= pen.z) { nLocal = new float3(0, sign(q.y), 0); q.y = nLocal.y * (bx.he.y + r); }
-                    else if (pen.x <= pen.z) { nLocal = new float3(sign(q.x), 0, 0); q.x = nLocal.x * (bx.he.x + r); }
-                    else { nLocal = new float3(0, 0, sign(q.z)); q.z = nLocal.z * (bx.he.z + r); }
+                {
+                    // centre inside the box: leave through the face it came in from (where it was at the start of
+                    // the step), falling back to the shallowest face. Avoids being shoved out of the far side.
+                    float3 qp = mul(bx.inv, prev[i] - bx.c);
+                    float3 outside = abs(qp) - bx.he;
+                    int axis;
+                    if (any(outside > 0f))
+                        axis = outside.x >= outside.y && outside.x >= outside.z ? 0 : (outside.y >= outside.z ? 1 : 2);
+                    else
+                    {
+                        float3 pen = bx.he - abs(q);
+                        axis = pen.y <= pen.x && pen.y <= pen.z ? 1 : (pen.x <= pen.z ? 0 : 2);
+                        qp = q;
+                    }
+                    float sg = qp[axis] >= 0f ? 1f : -1f;
+                    nLocal = default(float3);
+                    nLocal[axis] = sg;
+                    q[axis] = sg * (bx.he[axis] + r);
                 }
                 p = bx.c + mul(bx.rot, q);
                 lv = 1;

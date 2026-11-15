@@ -29,6 +29,8 @@ namespace SwarmTest
         [Tooltip("Taller than this is pathed around; lower is climbed over")]
         public float maxClimbHeight = 0.6f;
         public float obstacleInflate = 0.05f;
+        [Tooltip("Creatures start turning back this far from the edge of the area; they can never leave it")]
+        public float edgeMargin = 0.6f;
 
         [Header("Physics")]
         public Vector3 gravity = new Vector3(0f, -9.81f, 0f);
@@ -37,6 +39,14 @@ namespace SwarmTest
         [Range(0f, 1f)] public float airDamping = 0.01f;
         [Tooltip("Only BoxColliders on these layers are collided with")]
         public LayerMask environmentMask = ~(1 << 2);
+
+        [Header("Repellers")]
+        [Tooltip("Speed multiplier added at full fear (1 = twice as fast when right at the light's edge)")]
+        public float fleeSpeedBoost = 1f;
+        [Tooltip("Flow-field cost multiplier inside lit areas; high = route around, waiting at the edge if there's no other way")]
+        public float lightPathPenalty = 40f;
+        [Tooltip("Max speed (m/s) at which creatures caught inside a new light are pushed out")]
+        public float repelPushSpeed = 4f;
 
         [Header("Debug")]
         public bool showHud = true;
@@ -59,7 +69,9 @@ namespace SwarmTest
 
         int count, capacity;
         NativeArray<float3> heading, moveDir;
-        NativeArray<float> phase, speedMul, seed;
+        NativeArray<float> phase, speedMul, seed, panic;
+        readonly List<Vector4> zones = new List<Vector4>();
+        readonly List<Vector4> pathZones = new List<Vector4>();
 
         NativeArray<quaternion> restOffset;
         NativeArray<float3> bonePos;
@@ -114,7 +126,7 @@ namespace SwarmTest
             Dispose(ref contact); Dispose(ref onLevel);
             Dispose(ref cellHash); Dispose(ref sorted); Dispose(ref checks);
             Dispose(ref hashCount); Dispose(ref hashStart);
-            Dispose(ref heading); Dispose(ref moveDir); Dispose(ref phase); Dispose(ref speedMul); Dispose(ref seed);
+            Dispose(ref heading); Dispose(ref moveDir); Dispose(ref phase); Dispose(ref speedMul); Dispose(ref seed); Dispose(ref panic);
             Dispose(ref restOffset); Dispose(ref bonePos); Dispose(ref boneRot);
             Dispose(ref restLen); Dispose(ref restBend); Dispose(ref lift);
             if (boneTransforms.isCreated) boneTransforms.Dispose();
@@ -263,6 +275,17 @@ namespace SwarmTest
 
         void CopyFlow() { flowDir.Reinterpret<Vector3>().CopyFrom(Field.dir); }
 
+        float2 AreaMin { get { return new float2(Field.origin.x, Field.origin.z); } }
+        float2 AreaMax { get { return new float2(Field.origin.x + Field.width * Field.cellSize, Field.origin.z + Field.height * Field.cellSize); } }
+
+        Vector3 ClampToArea(Vector3 p, float margin)
+        {
+            float2 mn = AreaMin + margin, mx = AreaMax - margin;
+            p.x = Mathf.Clamp(p.x, mn.x, mx.x);
+            p.z = Mathf.Clamp(p.z, mn.y, mx.y);
+            return p;
+        }
+
         void EnsureCapacity(int n)
         {
             if (n <= capacity) return;
@@ -273,7 +296,7 @@ namespace SwarmTest
             Grow(ref contact, P); Grow(ref onLevel, P);
             Grow(ref cellHash, P); Grow(ref sorted, P); Grow(ref checks, P);
             Grow(ref heading, newCap); Grow(ref moveDir, newCap);
-            Grow(ref phase, newCap); Grow(ref speedMul, newCap); Grow(ref seed, newCap);
+            Grow(ref phase, newCap); Grow(ref speedMul, newCap); Grow(ref seed, newCap); Grow(ref panic, newCap);
             Grow(ref bonePos, newCap * B); Grow(ref boneRot, newCap * B);
 
             tableSize = Mathf.NextPowerOfTwo(P * 2);
@@ -307,6 +330,11 @@ namespace SwarmTest
             if (boneTransforms.length == c * B)
                 foreach (var t in creatureBones[c]) boneTransforms.Add(t);
 
+            Place(c);
+        }
+
+        void Place(int c)
+        {
             Vector3 basePos = spawnPoint != null ? spawnPoint.position : transform.position;
             Quaternion yaw = Quaternion.identity;
             Vector3 head = basePos;
@@ -315,6 +343,8 @@ namespace SwarmTest
                 Vector2 disc = UnityEngine.Random.insideUnitCircle * spawnRadius;
                 yaw = Quaternion.Euler(0f, UnityEngine.Random.Range(0f, 360f), 0f);
                 head = basePos + new Vector3(disc.x, UnityEngine.Random.Range(spawnHeight.x, spawnHeight.y), disc.y);
+                float bodyLen = restShape[K - 1].magnitude;
+                head = ClampToArea(head, Mathf.Min(bodyLen, Mathf.Min(areaSize.x, areaSize.y) * 0.45f));
                 if (!Physics.CheckCapsule(head, head + yaw * restShape[K - 1], 0.06f, environmentMask, QueryTriggerInteraction.Ignore)) break;
             }
 
@@ -333,6 +363,7 @@ namespace SwarmTest
             phase[c] = UnityEngine.Random.Range(0f, 10f);
             speedMul[c] = 1f + UnityEngine.Random.Range(-active.speedVariation, active.speedVariation);
             seed[c] = UnityEngine.Random.Range(0f, 1000f);
+            panic[c] = 1f;
         }
 
         void UpdatePopulation(float dt)
@@ -361,8 +392,21 @@ namespace SwarmTest
 
             float dt = Time.fixedDeltaTime;
             UpdatePopulation(dt);
-            if (target != null && Field.Build(target.position)) CopyFlow();
+            zones.Clear(); pathZones.Clear();
+            foreach (var r in SwarmRepeller.Active)
+            {
+                if (!r.IsLit) continue;
+                Vector3 rp = r.transform.position;
+                zones.Add(new Vector4(rp.x, rp.z, r.radius, r.fearMargin));
+                pathZones.Add(new Vector4(rp.x, rp.z, r.radius + r.fearMargin * 0.5f, 0f));
+            }
+            bool lightsChanged = Field.SetPenalty(pathZones, lightPathPenalty);
+            Vector3 targetPos = target != null ? ClampToArea(target.position, 0.05f) : Vector3.zero;
+            if (target != null && Field.Build(targetPos, lightsChanged)) CopyFlow();
             if (count == 0) return;
+
+            var rep = new NativeArray<float4>(zones.Count, Allocator.TempJob);
+            for (int i = 0; i < zones.Count; i++) rep[i] = zones[i];
 
             simWatch.Reset(); simWatch.Start();
             int P = count * K;
@@ -374,10 +418,12 @@ namespace SwarmTest
                 pos = pos, flowDir = flowDir, seed = seed, speedMul = speedMul,
                 heading = heading, moveDir = moveDir, phase = phase,
                 K = K, flowOrigin = Field.origin, cellSize = Field.cellSize, fw = Field.width, fh = Field.height,
-                hasTarget = target != null, target = target != null ? (float3)target.position : float3.zero,
+                hasTarget = target != null, target = targetPos,
+                areaMin = AreaMin, areaMax = AreaMax, edgeMargin = Mathf.Max(0.01f, edgeMargin),
                 arriveRadius = arriveRadius, time = Time.time, dt = dt,
                 maxTurn = cp.turnRate * Mathf.Deg2Rad * dt, wanderStrength = cp.wanderStrength,
-                wiggleFreq = cp.wiggleFrequency, wiggleAmp = cp.wiggleAmplitude * Mathf.Deg2Rad
+                wiggleFreq = cp.wiggleFrequency, wiggleAmp = cp.wiggleAmplitude * Mathf.Deg2Rad,
+                repellers = rep, panic = panic, fleeBoost = fleeSpeedBoost
             }.Schedule(count, 16);
 
             float h = dt / substeps;
@@ -388,7 +434,7 @@ namespace SwarmTest
                 dep = new StepJob
                 {
                     pos = pos, prev = prev, contact = contact, onLevel = onLevel,
-                    nLevel = nLevel, nPile = nPile, moveDir = moveDir, speedMul = speedMul,
+                    nLevel = nLevel, nPile = nPile, moveDir = moveDir, speedMul = speedMul, panic = panic,
                     restLen = restLen, restBend = restBend,
                     K = K, iterations = constraintIterations, h = h,
                     bendStiffness = cp.bendStiffness, minFoldRatio = cp.minFoldRatio, gravity = gravity,
@@ -410,8 +456,10 @@ namespace SwarmTest
 
                 dep = new LevelCollideJob
                 {
-                    pos = pos, delta = delta, rad = rad, boxes = boxes,
-                    contact = contact, onLevel = onLevel, nLevel = nLevel
+                    pos = pos, delta = delta, prev = prev, rad = rad, boxes = boxes,
+                    contact = contact, onLevel = onLevel, nLevel = nLevel,
+                    repellers = rep, maxRepelPush = repelPushSpeed * h,
+                    areaMin = AreaMin, areaMax = AreaMax
                 }.Schedule(P, 64, dep);
 
                 dep = new ChainJob
@@ -421,6 +469,10 @@ namespace SwarmTest
                 }.Schedule(count, 8, dep);
             }
             dep.Complete();
+            rep.Dispose();
+
+            for (int c = 0; c < count; c++)
+                if (pos[c * K].y < areaCenter.y - 2f) Place(c);   // fell out of the level
             simWatch.Stop();
             simMs = Mathf.Lerp(simMs, (float)simWatch.Elapsed.TotalMilliseconds, 0.1f);
         }
@@ -474,6 +526,8 @@ namespace SwarmTest
 
         void OnDrawGizmos()
         {
+            Gizmos.color = new Color(0.2f, 1f, 0.9f, 0.8f);
+            Gizmos.DrawWireCube(new Vector3(areaCenter.x, areaCenter.y + 0.5f, areaCenter.z), new Vector3(areaSize.x, 1f, areaSize.y));
             if (!Application.isPlaying) return;
             if (showFlowField && Field != null)
             {
@@ -495,6 +549,11 @@ namespace SwarmTest
                             Gizmos.color = Color.white;
                             Gizmos.DrawCube(c, new Vector3(cs * 0.8f, 0.02f, cs * 0.8f));
                             continue;
+                        }
+                        if (Field.penalty[i] > 0f)
+                        {
+                            Gizmos.color = new Color(1f, 0.6f, 0.15f, 0.25f);
+                            Gizmos.DrawCube(c, new Vector3(cs * 0.9f, 0.01f, cs * 0.9f));
                         }
                         float cost = Field.cost[i];
                         if (cost >= float.MaxValue) continue;

@@ -10,6 +10,7 @@ namespace SwarmTest
         public readonly bool[] blocked;
         public readonly float[] cost;
         public readonly Vector3[] dir;
+        public readonly float[] penalty;
 
         public int TargetCell { get; private set; }
         public float LastBuildMs { get; private set; }
@@ -32,6 +33,7 @@ namespace SwarmTest
             blocked = new bool[n];
             cost = new float[n];
             dir = new Vector3[n];
+            penalty = new float[n];
             heap = new MinHeap(n);
             TargetCell = -1;
         }
@@ -101,7 +103,7 @@ namespace SwarmTest
                     int ni = Index(nx, nz);
                     if (blocked[ni]) continue;
                     if (k >= 4 && (blocked[Index(nx, cz)] || blocked[Index(cx, nz)])) continue; // no corner cutting
-                    float nc = cc + DC[k];
+                    float nc = cc + DC[k] * (1f + penalty[ni]);
                     if (nc < cost[ni]) { cost[ni] = nc; heap.Push(ni, nc); }
                 }
             }
@@ -129,6 +131,26 @@ namespace SwarmTest
 
             LastBuildMs = (float)sw.Elapsed.TotalMilliseconds;
             return true;
+        }
+
+        // zones: x, z, radius (w unused). Returns true if any cell changed.
+        public bool SetPenalty(System.Collections.Generic.List<Vector4> zones, float value)
+        {
+            bool changed = false;
+            for (int z = 0; z < height; z++)
+                for (int x = 0; x < width; x++)
+                {
+                    Vector3 c = CellCenter(x, z);
+                    float p = 0f;
+                    for (int i = 0; i < zones.Count; i++)
+                    {
+                        float dx = c.x - zones[i].x, dz = c.z - zones[i].y;
+                        if (dx * dx + dz * dz < zones[i].z * zones[i].z) { p = value; break; }
+                    }
+                    int idx = Index(x, z);
+                    if (penalty[idx] != p) { penalty[idx] = p; changed = true; }
+                }
+            return changed;
         }
 
         // Bilinear blend of the four nearest cell directions (not normalised; zero if unknown).
